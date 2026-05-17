@@ -17,6 +17,10 @@ export const scansApi = {
     return http.get<ScanProgress>(`/scans/${scanId}/progress`)
   },
 
+  advance(scanId: string) {
+    return http.post<ScanProgress>(`/scans/${scanId}/advance`)
+  },
+
   create(input: CreateScanInput) {
     return http.post<Scan>('/scans', input)
   },

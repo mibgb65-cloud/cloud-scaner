@@ -30,10 +30,12 @@ const findingsError = ref('')
 const logEntries = ref<LogEntry[]>([])
 const deleting = ref(false)
 const showLog = ref(true)
+const progressError = ref('')
 const logContainer = ref<HTMLElement | null>(null)
 let pollTimer: number | undefined
 let logTimer: number | undefined
 let logVersion = 0
+let pollingProgress = false
 
 function findingBalance(f: Finding): string {
   if (!f.validation_json) return ''
@@ -87,15 +89,25 @@ async function loadLog() {
 }
 
 async function pollProgress() {
+  if (pollingProgress) return
+  pollingProgress = true
   try {
-    progress.value = await scansApi.progress(scanId)
+    progressError.value = ''
+    const currentStatus = progress.value?.status ?? scan.value?.status
+    progress.value = currentStatus === 'running' || !currentStatus
+      ? await scansApi.advance(scanId)
+      : await scansApi.progress(scanId)
     if (progress.value?.status !== 'running') {
       clearPolling()
       await load()
       await loadFindings()
       await loadLog()
     }
-  } catch { clearPolling() }
+  } catch (e: unknown) {
+    progressError.value = e instanceof Error ? e.message : '扫描推进失败'
+  } finally {
+    pollingProgress = false
+  }
 }
 
 let findingsTimer: number | undefined
@@ -175,6 +187,11 @@ function goFinding(f: Finding) { router.push(`/findings/${f.id}`) }
       <div v-if="scan?.error_message" class="border border-[var(--app-border)] bg-[var(--app-surface)] p-4">
         <p class="text-xs font-bold text-[var(--app-muted)]">错误信息</p>
         <p class="mt-1 font-mono text-sm" style="color: var(--expense)">{{ scan.error_message }}</p>
+      </div>
+
+      <div v-if="progressError" class="border border-[var(--app-border)] bg-[var(--app-surface)] p-4">
+        <p class="text-xs font-bold text-[var(--app-muted)]">扫描推进异常</p>
+        <p class="mt-1 font-mono text-sm" style="color: var(--expense)">{{ progressError }}</p>
       </div>
 
       <div class="grid grid-cols-3 gap-3">

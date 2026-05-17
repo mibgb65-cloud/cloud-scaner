@@ -202,6 +202,32 @@ scansRoutes.get('/api/v1/scans/:scanId/progress', async (c) => {
   })
 })
 
+scansRoutes.post('/api/v1/scans/:scanId/advance', async (c) => {
+  const scanId = c.req.param('scanId')
+  const db = c.env.DB
+  const kv = c.env.SCAN_KV
+
+  const scan = await db.prepare('SELECT status, progress_scanned, progress_skipped, progress_findings, updated_at FROM scans WHERE id = ?').bind(scanId).first<{ status: string; progress_scanned: number; progress_skipped: number; progress_findings: number; updated_at: string }>()
+  assertFound(scan, '扫描任务不存在')
+  if (!scan) throw new Error('unreachable')
+
+  if (scan.status === 'running') {
+    await advanceScanChunk(scanId, db, kv)
+  }
+
+  const cached = await kv.get(`scan:progress:${scanId}`, 'json') as { scanned: number; skipped: number; findings: number; status: string; updatedAt: string } | null
+  if (cached) return ok(c, cached)
+
+  const freshScan = await db.prepare('SELECT status, progress_scanned, progress_skipped, progress_findings, updated_at FROM scans WHERE id = ?').bind(scanId).first<{ status: string; progress_scanned: number; progress_skipped: number; progress_findings: number; updated_at: string }>()
+  return ok(c, {
+    scanned: freshScan?.progress_scanned ?? scan.progress_scanned,
+    skipped: freshScan?.progress_skipped ?? scan.progress_skipped,
+    findings: freshScan?.progress_findings ?? scan.progress_findings,
+    status: freshScan?.status ?? scan.status,
+    updatedAt: freshScan?.updated_at ?? scan.updated_at
+  })
+})
+
 // Cancel scan
 scansRoutes.post('/api/v1/scans/:scanId/cancel', async (c) => {
   const scanId = c.req.param('scanId')
@@ -451,7 +477,7 @@ async function logScanStart(scanId: string, input: CreateScanInputType, state: S
   if (state.autoValidate) await pushLog(kv, scanId, 'info', '已启用自动验证（仅保存有效密钥）', nowIso())
   await pushLog(kv, scanId, 'info', `开始扫描: ${state.query} (limit: ${state.limitCount === 0 ? '无限' : state.limitCount})`, nowIso())
   await pushLog(kv, scanId, 'info', state.skipHistory ? '已关闭历史记录去重（将扫描所有文件）' : '已启用历史记录去重', nowIso())
-  await pushLog(kv, scanId, 'info', `分片扫描已就绪: 每次进度轮询最多处理 ${SCAN_CHUNK_FILE_LIMIT} 个文件`, nowIso())
+  await pushLog(kv, scanId, 'info', `分片扫描已就绪: 每次前端轮询最多处理 ${SCAN_CHUNK_FILE_LIMIT} 个文件`, nowIso())
 }
 
 // Create scan (returns immediately, runs in background)
@@ -481,13 +507,7 @@ scansRoutes.post('/api/v1/scans', async (c) => {
   await logScanStart(scanId, input, state, kv)
   await kv.put(`scan:progress:${scanId}`, JSON.stringify({ scanned: 0, skipped: 0, findings: 0, status: 'running', updatedAt: now }), { expirationTtl: 3600 })
 
-  // Kick one small chunk immediately; later progress polling continues the scan.
-  const execCtx = (c as any).executionCtx as ExecutionContext | undefined
-  if (execCtx?.waitUntil) {
-    execCtx.waitUntil(advanceScanChunk(scanId, db, kv))
-  } else {
-    advanceScanChunk(scanId, db, kv)
-  }
+  await pushLog(kv, scanId, 'info', '等待详情页轮询推进扫描...', nowIso())
 
   return ok(c, { id: scanId, query, status: 'running' }, 202)
 })
