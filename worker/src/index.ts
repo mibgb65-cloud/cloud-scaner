@@ -22,7 +22,7 @@ export default {
         return Response.json(
           {
             code: 'INIT_FAILED',
-            message: error instanceof Error ? error.message : '初始化失败',
+            message: error instanceof Error ? error.message : 'init failed',
             requestId,
             timestamp: new Date().toISOString()
           },
