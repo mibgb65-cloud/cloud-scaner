@@ -27,6 +27,13 @@ CREATE TABLE IF NOT EXISTS scans (
   completed_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS scan_runtime (
+  scan_id TEXT PRIMARY KEY REFERENCES scans(id) ON DELETE CASCADE,
+  state_json TEXT NOT NULL,
+  lock_until TEXT,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS findings (
   id TEXT PRIMARY KEY,
   scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,

@@ -5,6 +5,10 @@ export interface Rule {
   severity: 'critical' | 'high' | 'medium' | 'low'
 }
 
+const OPENAI_API_KEY_PATTERN = /sk-(?:proj-[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{32,})/g
+const DEEPSEEK_API_KEY_PATTERN = /sk-[A-Za-z0-9_-]{32,}/g
+const DEEPSEEK_CONTEXT_PATTERN = /(deepseek|DEEPSEEK_API_KEY|deepseek_api)\s*[=:]\s*['"]?(sk-[A-Za-z0-9_-]{20,})['"]?/gi
+
 export const DEFAULT_RULES: Rule[] = [
   {
     name: 'AWS Access Key',
@@ -86,19 +90,19 @@ export const DEFAULT_RULES: Rule[] = [
   },
   {
     name: 'OpenAI API Key',
-    pattern: /sk-[A-Za-z0-9]{48,}/g,
+    pattern: OPENAI_API_KEY_PATTERN,
     description: 'OpenAI API Key',
     severity: 'high'
   },
   {
     name: 'DeepSeek API Key',
-    pattern: /sk-[A-Za-z0-9]{32,}/g,
+    pattern: DEEPSEEK_API_KEY_PATTERN,
     description: 'DeepSeek / OpenAI-compatible API Key',
     severity: 'high'
   },
   {
     name: 'DeepSeek Key with Context',
-    pattern: /(deepseek|DEEPSEEK_API_KEY|deepseek_api)\s*[=:]\s*['"]?(sk-[A-Za-z0-9]{20,})['"]?/gi,
+    pattern: DEEPSEEK_CONTEXT_PATTERN,
     description: 'DeepSeek API Key with context',
     severity: 'critical'
   },

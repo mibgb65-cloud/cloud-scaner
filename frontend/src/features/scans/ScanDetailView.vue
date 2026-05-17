@@ -32,6 +32,8 @@ const deleting = ref(false)
 const showLog = ref(true)
 const progressError = ref('')
 const logContainer = ref<HTMLElement | null>(null)
+const PROGRESS_POLL_MS = 3000
+const FINDINGS_POLL_MS = 8000
 let pollTimer: number | undefined
 let pollingProgress = false
 
@@ -82,6 +84,7 @@ async function appendLogs(entries: LogEntry[] = []) {
 }
 
 async function pollProgress() {
+  if (document.hidden) return
   if (pollingProgress) return
   pollingProgress = true
   try {
@@ -107,11 +110,12 @@ async function pollProgress() {
 let findingsTimer: number | undefined
 
 function startPolling() {
+  if (document.hidden || pollTimer) return
   pollProgress()
-  pollTimer = window.setInterval(pollProgress, 2000)
+  pollTimer = window.setInterval(pollProgress, PROGRESS_POLL_MS)
   // Also refresh findings during scan
   loadFindings()
-  findingsTimer = window.setInterval(loadFindings, 3000)
+  findingsTimer = window.setInterval(loadFindings, FINDINGS_POLL_MS)
 }
 
 function clearPolling() {
@@ -124,12 +128,25 @@ async function scrollToBottom() {
   if (logContainer.value) logContainer.value.scrollTop = logContainer.value.scrollHeight
 }
 
+function handleVisibilityChange() {
+  if (document.hidden) {
+    clearPolling()
+    return
+  }
+  if ((progress.value?.status ?? scan.value?.status) === 'running') startPolling()
+  else loadFindings()
+}
+
 onMounted(async () => {
+  document.addEventListener('visibilitychange', handleVisibilityChange)
   await load(); await loadFindings()
   if (scan.value?.status === 'running') startPolling()
 })
 watch(() => scan.value?.status, (s) => { if (s === 'running' && !pollTimer) startPolling() })
-onBeforeUnmount(clearPolling)
+onBeforeUnmount(() => {
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+  clearPolling()
+})
 
 async function cancelScan() {
   const accepted = await confirm({

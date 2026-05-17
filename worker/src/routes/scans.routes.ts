@@ -17,8 +17,15 @@ import type { ValidationResult } from '../services/validator.service'
 const scansRoutes = new Hono<{ Bindings: Env; Variables: AppVariables }>()
 const SCAN_CHUNK_FILE_LIMIT = 2
 const SCAN_CHUNK_MAX_MS = 15_000
-const SCAN_STATE_TTL = 24 * 60 * 60
 const SCAN_LOCK_TTL = 60
+
+const SCAN_RUNTIME_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS scan_runtime (
+  scan_id TEXT PRIMARY KEY REFERENCES scans(id) ON DELETE CASCADE,
+  state_json TEXT NOT NULL,
+  lock_until TEXT,
+  updated_at TEXT NOT NULL
+)`
 
 type LogLevel = 'info' | 'found' | 'skip' | 'error'
 
@@ -86,20 +93,58 @@ function summarizeRules(findings: Array<{ ruleName: string }>): string {
   return Array.from(counts.entries()).map(([rule, count]) => `${rule} x${count}`).join(', ')
 }
 
-function scanStateKey(scanId: string): string {
-  return `scan:state:${scanId}`
+async function ensureScanRuntimeSchema(db: D1Database): Promise<void> {
+  await db.prepare(SCAN_RUNTIME_SCHEMA_SQL).run()
 }
 
-function scanLockKey(scanId: string): string {
-  return `scan:lock:${scanId}`
+async function loadScanState(db: D1Database, scanId: string): Promise<ScanState | null> {
+  await ensureScanRuntimeSchema(db)
+  const row = await db.prepare('SELECT state_json FROM scan_runtime WHERE scan_id = ?')
+    .bind(scanId)
+    .first<{ state_json: string }>()
+  return row?.state_json ? JSON.parse(row.state_json) as ScanState : null
 }
 
-async function loadScanState(kv: KVNamespace, scanId: string): Promise<ScanState | null> {
-  return await kv.get(scanStateKey(scanId), 'json') as ScanState | null
+async function saveScanState(db: D1Database, scanId: string, state: ScanState): Promise<void> {
+  await ensureScanRuntimeSchema(db)
+  await db.prepare(`
+    INSERT INTO scan_runtime (scan_id, state_json, lock_until, updated_at)
+    VALUES (?, ?, NULL, ?)
+    ON CONFLICT(scan_id) DO UPDATE SET
+      state_json = excluded.state_json,
+      updated_at = excluded.updated_at
+  `).bind(scanId, JSON.stringify(state), nowIso()).run()
 }
 
-async function saveScanState(kv: KVNamespace, scanId: string, state: ScanState): Promise<void> {
-  await kv.put(scanStateKey(scanId), JSON.stringify(state), { expirationTtl: SCAN_STATE_TTL })
+async function deleteScanState(db: D1Database, scanId: string): Promise<void> {
+  await ensureScanRuntimeSchema(db)
+  await db.prepare('DELETE FROM scan_runtime WHERE scan_id = ?').bind(scanId).run()
+}
+
+async function acquireScanLock(db: D1Database, scanId: string): Promise<'acquired' | 'locked' | 'missing'> {
+  await ensureScanRuntimeSchema(db)
+  const existing = await db.prepare('SELECT lock_until FROM scan_runtime WHERE scan_id = ?')
+    .bind(scanId)
+    .first<{ lock_until: string | null }>()
+  if (!existing) return 'missing'
+
+  const now = nowIso()
+  if (existing.lock_until && existing.lock_until > now) return 'locked'
+
+  const lockUntil = new Date(Date.now() + SCAN_LOCK_TTL * 1000).toISOString()
+  const result = await db.prepare(`
+    UPDATE scan_runtime
+    SET lock_until = ?, updated_at = ?
+    WHERE scan_id = ? AND (lock_until IS NULL OR lock_until <= ?)
+  `).bind(lockUntil, now, scanId, now).run() as { meta?: { changes?: number } }
+
+  return (result.meta?.changes ?? 0) > 0 ? 'acquired' : 'locked'
+}
+
+async function releaseScanLock(db: D1Database, scanId: string): Promise<void> {
+  await db.prepare('UPDATE scan_runtime SET lock_until = NULL, updated_at = ? WHERE scan_id = ?')
+    .bind(nowIso(), scanId)
+    .run()
 }
 
 function buildQuery(input: CreateScanInput): string {
@@ -229,6 +274,7 @@ scansRoutes.post('/api/v1/scans/:scanId/cancel', async (c) => {
   // Set cancel flag in KV (checked in scan loop)
   await kv.put(`scan:cancel:${scanId}`, '1', { expirationTtl: 3600 })
   await db.prepare("UPDATE scans SET status = 'cancelled', updated_at = ? WHERE id = ?").bind(nowIso(), scanId).run()
+  await deleteScanState(db, scanId)
 
   return ok(c, { cancelled: true })
 })
@@ -372,39 +418,41 @@ async function processSearchResult(scanId: string, state: ScanState, sr: SearchR
   await db.prepare('INSERT OR IGNORE INTO scanned_files (scan_id, file_key, created_at) VALUES (?, ?, ?)').bind(scanId, fileKey, nowIso()).run()
 }
 
-async function completeScan(scanId: string, state: ScanState, db: D1Database, kv: KVNamespace, logger: ScanLogger) {
+async function completeScan(scanId: string, state: ScanState, db: D1Database, logger: ScanLogger) {
   const now = nowIso()
   await db.prepare(`UPDATE scans SET status = 'completed', progress_scanned = ?, progress_skipped = ?, progress_findings = ?, updated_at = ?, completed_at = ? WHERE id = ?`).bind(state.scanned, state.skipped, state.findings, now, now, scanId).run()
   await pushLog(logger, 'info', `扫描完成: ${state.scanned} 个文件, ${state.skipped} 跳过, ${state.findings} 发现`, nowIso())
-  await kv.delete(scanStateKey(scanId))
+  await deleteScanState(db, scanId)
   await logAction(db, 'scan_create', JSON.stringify({ scanId, query: state.query, scanned: state.scanned, findings: state.findings }), state.userId, state.ip)
 }
 
-async function failScan(scanId: string, message: string, db: D1Database, kv: KVNamespace, logger: ScanLogger) {
+async function failScan(scanId: string, message: string, db: D1Database, logger: ScanLogger) {
   await db.prepare("UPDATE scans SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?").bind(message, nowIso(), scanId).run()
   await pushLog(logger, 'error', `扫描失败: ${message}`, nowIso())
-  await kv.delete(scanStateKey(scanId))
+  await deleteScanState(db, scanId)
 }
 
 async function advanceScanChunk(scanId: string, db: D1Database, kv: KVNamespace, logger: ScanLogger) {
-  const lockKey = scanLockKey(scanId)
   let lockAcquired = false
 
   try {
-    const locked = await kv.get(lockKey)
-    if (locked) {
+    const lock = await acquireScanLock(db, scanId)
+    if (lock === 'locked') {
       await pushLog(logger, 'info', '上一个扫描分片仍在执行，等待下一次轮询...', nowIso())
       return
     }
-    await kv.put(lockKey, '1', { expirationTtl: SCAN_LOCK_TTL })
+    if (lock === 'missing') {
+      await failScan(scanId, '扫描状态不存在，请重新创建扫描', db, logger)
+      return
+    }
     lockAcquired = true
 
     const scan = await db.prepare("SELECT status FROM scans WHERE id = ?").bind(scanId).first<{ status: string }>()
     if (!scan || scan.status !== 'running') return
 
-    const state = await loadScanState(kv, scanId)
+    const state = await loadScanState(db, scanId)
     if (!state) {
-      await failScan(scanId, '扫描状态不存在，请重新创建扫描', db, kv, logger)
+      await failScan(scanId, '扫描状态不存在，请重新创建扫描', db, logger)
       return
     }
 
@@ -416,7 +464,7 @@ async function advanceScanChunk(scanId: string, db: D1Database, kv: KVNamespace,
     const rotator = await TokenRotator.load(db)
     const token = rotator.next()
     if (!token) {
-      await failScan(scanId, '未添加 GitHub Token', db, kv, logger)
+      await failScan(scanId, '未添加 GitHub Token', db, logger)
       return
     }
     await TokenRotator.markUsed(db, token)
@@ -428,13 +476,13 @@ async function advanceScanChunk(scanId: string, db: D1Database, kv: KVNamespace,
     while (processed < SCAN_CHUNK_FILE_LIMIT && Date.now() - startedAt < SCAN_CHUNK_MAX_MS) {
       if (await isCancelled(kv, scanId)) {
         await pushLog(logger, 'error', '扫描已终止', nowIso())
-        await kv.delete(scanStateKey(scanId))
+        await deleteScanState(db, scanId)
         return
       }
 
       const result = await nextSearchResult(client, state)
       if (!result) {
-        await completeScan(scanId, state, db, kv, logger)
+        await completeScan(scanId, state, db, logger)
         return
       }
 
@@ -447,20 +495,25 @@ async function advanceScanChunk(scanId: string, db: D1Database, kv: KVNamespace,
       }
     }
 
-    await saveScanState(kv, scanId, state)
+    if (await isCancelled(kv, scanId)) {
+      await deleteScanState(db, scanId)
+      return
+    }
+
+    await saveScanState(db, scanId, state)
     if (processed > 0) {
       await pushLog(logger, 'info', `分片完成: 本次处理 ${processed} 个文件，等待下一次进度轮询继续`, nowIso())
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
     try {
-      await failScan(scanId, message, db, kv, logger)
+      await failScan(scanId, message, db, logger)
     } catch (failErr) {
       console.error('failed to mark scan failed', failErr)
       throw err
     }
   } finally {
-    if (lockAcquired) await kv.delete(lockKey)
+    if (lockAcquired) await releaseScanLock(db, scanId)
   }
 }
 
@@ -499,12 +552,11 @@ scansRoutes.post('/api/v1/scans', async (c) => {
   const scanId = newId('scan')
   const now = nowIso()
   const db = c.env.DB
-  const kv = c.env.SCAN_KV
   const state = createInitialState(input, query, c.get('currentUserId'), ip)
 
   await db.prepare(`INSERT INTO scans (id, query, keyword, org, lang, status, limit_count, min_entropy, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)`).bind(scanId, query, input.keyword || '', input.org || '', input.lang || '', input.limit, input.minEntropy, now, now).run()
 
-  await saveScanState(kv, scanId, state)
+  await saveScanState(db, scanId, state)
 
   return ok(c, { id: scanId, query, status: 'running' }, 202)
 })

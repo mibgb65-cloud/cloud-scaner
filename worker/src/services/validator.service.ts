@@ -152,7 +152,7 @@ export async function checkAnthropicKey(apiKey: string): Promise<ValidationResul
 }
 
 // Key extraction patterns ported from cli.py
-const SK_KEY_PATTERN = /sk-[A-Za-z0-9]{20,}/
+const SK_KEY_PATTERN = /sk-(?:proj-[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{20,})/
 const ANTHROPIC_KEY_PATTERN = /sk-ant-[A-Za-z0-9\-_]{40,}/
 const GOOGLE_KEY_PATTERN = /AIza[0-9A-Za-z\-_]{35}/
 
