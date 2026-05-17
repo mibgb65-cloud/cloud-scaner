@@ -7,14 +7,28 @@ export default {
     const url = new URL(request.url)
 
     if (url.pathname === '/api/init' || url.pathname === '/api/init/') {
-      const result = await ensureDefaultAdmin(env)
-      return Response.json({
-        code: 'OK',
-        message: 'ok',
-        data: { initialized: true, ...result },
-        requestId: crypto.randomUUID(),
-        timestamp: new Date().toISOString()
-      })
+      const requestId = crypto.randomUUID()
+      try {
+        const result = await ensureDefaultAdmin(env)
+        return Response.json({
+          code: 'OK',
+          message: 'ok',
+          data: { initialized: true, ...result },
+          requestId,
+          timestamp: new Date().toISOString()
+        })
+      } catch (error) {
+        console.error('init failed', error)
+        return Response.json(
+          {
+            code: 'INIT_FAILED',
+            message: error instanceof Error ? error.message : '初始化失败',
+            requestId,
+            timestamp: new Date().toISOString()
+          },
+          { status: 500 }
+        )
+      }
     }
 
     if (url.pathname === '/api' || url.pathname.startsWith('/api/')) {
